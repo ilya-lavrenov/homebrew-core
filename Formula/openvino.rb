@@ -22,10 +22,15 @@ class Openvino < Formula
   end
 
   depends_on "cmake" => [:build, :test]
+  depends_on "cython" => [:build]
   depends_on "flatbuffers" => :build
   depends_on "pkg-config" => [:build, :test]
-  depends_on "protobuf" => :build
+  depends_on "protobuf@21" => :build
+  depends_on "pybind11" => :build
+  depends_on "python@3.10" => :build
   depends_on "python@3.11" => :build
+  depends_on "xbyak" => :build
+  depends_on "numpy"
   depends_on "pugixml"
   depends_on "snappy"
   depends_on "tbb"
@@ -50,14 +55,8 @@ class Openvino < Formula
     end
   end
 
-  resource "ade" do
-    url "https://github.com/opencv/ade/archive/refs/tags/v0.1.1f.tar.gz"
-    sha256 "c316680efbb5dd3ac4e10bb8cea345cf26a6a25ebc22418f8f0b8ca931a550e9"
-  end
-
-  resource "ittapi" do
-    url "https://github.com/intel/ittapi/archive/refs/tags/v3.24.0.tar.gz"
-    sha256 "36c42d3f2446ddfaa2d7dfa02dfaa79615933f1a68a72d7e4f1d70de7b56e2c9"
+  on_intel do
+    depends_on "xbyak" => :build
   end
 
   resource "xbyak" do
@@ -75,17 +74,23 @@ class Openvino < Formula
     sha256 "090d3e10ec662a98a2a72f1bf053f793efc645824f0d4b779e0ce47468a0890e"
   end
 
+  def pythons
+    deps.map(&:to_formula)
+        .select { |f| f.name.match?(/^python@\d\.\d+$/) }
+        .sort_by(&:version) # so that `bin/f2py` and `bin/f2py3` use python3.10
+        .map { |f| f.opt_libexec/"bin/python" }
+  end
+
   def install
     # Remove git cloned 3rd party to make sure formula dependencies are used
-    dependencies = %w[thirdparty/ade thirdparty/ittapi
-                      thirdparty/xbyak thirdparty/onnx/onnx
+    dependencies = %w[thirdparty/xbyak
+                      thirdparty/ittapi
+                      thirdparty/onnx/onnx
                       src/plugins/intel_cpu/thirdparty/onednn
                       src/plugins/intel_gpu/thirdparty/onednn_gpu
                       src/plugins/intel_cpu/thirdparty/ComputeLibrary]
     dependencies.each { |d| (buildpath/d).rmtree }
 
-    resource("ade").stage buildpath/"thirdparty/ade"
-    resource("ittapi").stage buildpath/"thirdparty/ittapi/ittapi"
     resource("xbyak").stage buildpath/"thirdparty/xbyak"
     resource("onnx").stage buildpath/"thirdparty/onnx/onnx"
     resource("onednn_cpu").stage buildpath/"src/plugins/intel_cpu/thirdparty/onednn"
@@ -98,6 +103,7 @@ class Openvino < Formula
 
     cmake_args = std_cmake_args + %w[
       -DCMAKE_OSX_DEPLOYMENT_TARGET=
+      -DENABLE_GAPI_PREPROCESSING=OFF
       -DENABLE_CPPLINT=OFF
       -DENABLE_CLANG_FORMAT=OFF
       -DENABLE_NCC_STYLE=OFF
@@ -112,6 +118,8 @@ class Openvino < Formula
       -DENABLE_SYSTEM_PROTOBUF=ON
       -DENABLE_SYSTEM_FLATBUFFERS=ON
       -DENABLE_SYSTEM_SNAPPY=ON
+      -DCMAKE_CXX_COMPILER_LAUNCHER=/opt/homebrew/bin/ccache
+      -DCMAKE_C_COMPILER_LAUNCHER=/opt/homebrew/bin/ccache
     ]
 
     system "cmake", "-S", buildpath.to_s, "-B", "#{buildpath}/openvino_build", *cmake_args
@@ -123,6 +131,25 @@ class Openvino < Formula
                     cpu gpu batch multi hetero
                     ir onnx paddle pytorch tensorflow tensorflow_lite]
     components.each { |comp| system "cmake", "--install", "#{buildpath}/openvino_build", "--component", comp }
+
+    # build python bindings
+    pythons.each do |python|
+      xy = Language::Python.major_minor_version(python)
+
+      system "cmake", *std_cmake_args,
+        "-DENABLE_WHEEL=OFF",
+        "-DENABLE_PYTHON=ON",
+        "-DPYTHON_EXECUTABLE=#{python}",
+        "-DCPACK_GENERATOR=BREW",
+        "-DOpenVINODeveloperPackage_DIR=#{buildpath}/openvino_build",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=/opt/homebrew/bin/ccache",
+        "-DCMAKE_C_COMPILER_LAUNCHER=/opt/homebrew/bin/ccache",
+        "-S", "#{buildpath.to_s}/src/bindings/python",
+        "-B", "#{buildpath}/openvino_python_#{xy}_build"
+
+      system "cmake", "--build", "#{buildpath}/openvino_python_#{xy}_build"
+      system "cmake", "--install", "#{buildpath}/openvino_python_#{xy}_build"
+    end
   end
 
   test do
@@ -169,12 +196,19 @@ class Openvino < Formula
       project(openvino_frontends_test)
       set(CMAKE_CXX_STANDARD 11)
       add_executable(${PROJECT_NAME} openvino_available_frontends.cpp)
-      find_package(OpenVINO REQUIRED COMPONENTS Runtime ONNX TensorFlow Paddle)
+      find_package(OpenVINO REQUIRED COMPONENTS Runtime Runtime ONNX TensorFlow TensorFlowLite Paddle PyTorch)
       target_link_libraries(${PROJECT_NAME} PRIVATE openvino::runtime)
     EOS
 
     system "cmake", testpath.to_s
     system "cmake", "--build", testpath.to_s
     assert_equal "6", shell_output("#{testpath}/openvino_frontends_test").strip
+
+    pythons.each do |python|
+      system python, "-c", <<~EOS
+        import openvino.runtime as ov
+        assert '#{version}' in ov.__version__
+      EOS
+    end
   end
 end
